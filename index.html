@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mana Radar - Live MTG LFG</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+</head>
+<body class="bg-slate-900 text-slate-100 font-sans min-h-screen flex flex-col justify-between">
+
+    <header class="p-4 bg-slate-800 border-b border-slate-700 text-center shadow-md">
+        <h1 class="text-xl font-bold text-amber-500 tracking-wide">✨ MANA RADAR</h1>
+        <p class="text-xs text-slate-400">Find local planeswalkers in real-time</p>
+    </header>
+
+    <main class="p-4 max-w-md mx-auto w-full space-y-6 flex-grow">
+        
+        <section class="bg-slate-800 p-5 rounded-xl border border-slate-700 shadow-lg space-y-4">
+            <h2 class="text-lg font-semibold border-b border-slate-700 pb-2">Broadcast Your Location</h2>
+            
+            <div class="space-y-3">
+                <div>
+                    <label class="block text-xs font-medium text-slate-400 mb-1">Handle / Name</label>
+                    <input id="playerName" type="text" placeholder="e.g., Jace_EDH" class="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-amber-500 text-slate-200">
+                </div>
+                
+                <div>
+                    <label class="block text-xs font-medium text-slate-400 mb-1">Preferred Format</label>
+                    <select id="mtgFormat" class="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-amber-500 text-slate-200">
+                        <option>Commander / EDH</option>
+                        <option>Modern</option>
+                        <option>Standard</option>
+                        <option>Limited / Draft</option>
+                        <option>Casual Cube</option>
+                    </select>
+                </div>
+
+                <div>
+                    <label class="block text-xs font-medium text-slate-400 mb-1">Current Spot & Details</label>
+                    <input id="locationNotes" type="text" placeholder="e.g., Terminal B, near Gate B12" class="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-amber-500 text-slate-200">
+                </div>
+            </div>
+
+            <button id="checkInBtn" onclick="handleCheckIn()" class="w-full bg-amber-500 hover:bg-amber-600 text-slate-900 font-bold py-3 rounded-lg text-sm transition shadow-md">
+                🛰️ Check In & Scan Area
+            </button>
+            <p id="geoStatus" class="text-center text-xs text-slate-400 hidden italic"></p>
+        </section>
+
+        <section class="space-y-3">
+            <h2 class="text-sm font-semibold uppercase tracking-wider text-slate-400">Players Nearby (Within 5 Miles)</h2>
+            <div id="playerList" class="space-y-3">
+                <p class="text-sm text-slate-500 italic text-center py-4">Check in to see who is nearby...</p>
+            </div>
+        </section>
+
+    </main>
+
+    <footer class="p-4 text-center text-xs text-slate-500 border-t border-slate-800">
+        Active check-ins expire automatically after 3 hours.
+    </footer>
+
+    <script>
+        // CONFIGURATION: Replace these with your real project credentials from the dashboard
+        const SUPABASE_URL = "https://vhpfruffrbdtlysicdds.supabase.co/rest/v1/"; 
+        const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZocGZydWZmcmJkdGx5c2ljZGRzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzk5MDUwNzUsImV4cCI6MjA5NTQ4MTA3NX0.V8eU1P4x2QhL9KxK2mQe5LY5R5I1Oq5F5Q5I1Oq5F5Q";
+
+        // Initialize Supabase client
+        const supabaseClient = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+        
+        let userCoords = null;
+
+        function handleCheckIn() {
+            const statusText = document.getElementById('geoStatus');
+            statusText.classList.remove('hidden');
+            statusText.innerText = "Requesting GPS signal...";
+
+            if (!navigator.geolocation) {
+                statusText.innerText = "Geolocation is not supported by your browser.";
+                return;
+            }
+
+            navigator.geolocation.getCurrentPosition(
+                async (position) => {
+                    userCoords = {
+                        lat: position.coords.latitude,
+                        lng: position.coords.longitude
+                    };
+                    statusText.innerText = "Location locked. Syncing with Mana Radar...";
+                    
+                    await executeLiveSync();
+                },
+                (error) => {
+                    statusText.innerText = "Error: Please enable location permissions.";
+                    console.error(error);
+                }
+            );
+        }
+
+        async function executeLiveSync() {
+            const name = document.getElementById('playerName').value || "Anonymous Mage";
+            const format = document.getElementById('mtgFormat').value;
+            const notes = document.getElementById('locationNotes').value || "In transit";
+            const statusText = document.getElementById('geoStatus');
+
+            try {
+                // 1. Write the user's check-in to the database
+                // PostGIS requires values formatted as 'POINT(longitude latitude)' - note that longitude comes first!
+                const { error: insertError } = await supabaseClient
+                    .from('check_ins')
+                    .insert([
+                        { 
+                            player_name: name, 
+                            format: format, 
+                            notes: notes,
+                            location: `POINT(${userCoords.lng} ${userCoords.lat})`
+                        }
+                    ]);
+
+                if (insertError) throw insertError;
+
+                // 2. Call the Postgres function we created to search for everyone within 5 miles (8046 meters)
+                const { data: nearbyPlayers, error: rpcError } = await supabaseClient
+                    .rpc('get_nearby_players', {
+                        user_lat: userCoords.lat,
+                        user_lng: userCoords.lng,
+                        max_meters: 8046.72 
+                    });
+
+                if (rpcError) throw rpcError;
+
+                statusText.innerText = `Checked in successfully! Broadcast active.`;
+                renderPlayers(nearbyPlayers, name);
+
+            } catch (err) {
+                console.error("Database Error:", err);
+                statusText.innerText = "Error syncing data to backend.";
+            }
+        }
+
+        function renderPlayers(players, currentUserName) {
+            const container = document.getElementById('playerList');
+            container.innerHTML = ""; 
+
+            if (players.length === 0) {
+                container.innerHTML = `<p class="text-sm text-slate-500 italic text-center py-4">Nobody else is nearby right now. Keep your eyes peeled!</p>`;
+                return;
+            }
+
+            players.forEach(player => {
+                const isSelf = player.player_name === currentUserName;
+                const card = document.createElement('div');
+                card.className = `p-4 rounded-xl border flex justify-between items-center ${isSelf ? 'bg-amber-950/30 border-amber-500/40' : 'bg-slate-800 border-slate-700'}`;
+                
+                // Format distance display
+                const distDisplay = player.distance_miles < 0.1 ? "Here" : `${player.distance_miles.toFixed(1)} mi`;
+
+                card.innerHTML = `
+                    <div>
+                        <div class="flex items-center gap-2">
+                            <span class="font-bold ${isSelf ? 'text-amber-400' : 'text-slate-200'}">${player.player_name} ${isSelf ? '(You)' : ''}</span>
+                            <span class="bg-slate-700 text-slate-300 text-[10px] uppercase font-bold px-2 py-0.5 rounded-full">${player.format}</span>
+                        </div>
+                        <p class="text-sm text-slate-400 mt-1">${player.notes}</p>
+                    </div>
+                    <div class="text-right">
+                        <span class="text-xs font-mono text-slate-400 bg-slate-900 px-2 py-1 rounded">${distDisplay}</span>
+                    </div>
+                `;
+                container.appendChild(card);
+            });
+        }
+    </script>
+</body>
+</html>
